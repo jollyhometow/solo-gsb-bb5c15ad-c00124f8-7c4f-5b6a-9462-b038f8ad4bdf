@@ -1,0 +1,26 @@
+services:
+  simulator:
+    build: .
+    image: api-scenario-simulator:latest
+    container_name: api-scenario-simulator
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite database location inside the container (volume mounted below).
+      SIM_DB_PATH: /data/sim.db
+      # Scenario auto-loaded on first start if none is active yet.
+      SIM_SCENARIO_FILE: /app/scenarios/example.yaml
+      SIM_AUTOLOAD_SCENARIO: "true"
+      SIM_BUSY_TIMEOUT_MS: "10000"
+    volumes:
+      - sim-data:/data
+      - ./scenarios:/app/scenarios:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/_sim/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  sim-data:

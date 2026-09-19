@@ -1,0 +1,174 @@
+# 示例：电商下单联调场景
+# 状态流转：init --下单--> awaiting_payment --支付--> paid --发货--> shipped
+name: order-demo
+description: 下单 / 支付 / 发货的有状态联调场景
+initial_state: init
+initial_vars:
+  currency: CNY
+
+routes:
+  # ------------------------------------------------------------------ 下单
+  - path: /orders
+    methods: [POST]
+    rules:
+      # 高优先级：请求体缺少 amount 时返回参数错误，且不推进状态
+      - name: create-order-missing-amount
+        priority: 10
+        match:
+          - body: amount
+            exists: false
+        response:
+          status: 400
+          headers:
+            content-type: application/json
+          body:
+            error: missing_field
+            message: "字段 amount 必填"
+            request_id: "{{ uuid() }}"
+
+      # 普通下单：金额 > 0 才接受，生成订单号并迁移到待支付
+      - name: create-order
+        priority: 100
+        match:
+          - body: amount
+            gt: 0
+          - body: items
+            contains:
+              sku: SKU-1001
+        response:
+          status: 201
+          headers:
+            content-type: application/json
+            x-request-id: "{{ uuid() }}"
+          body:
+            order_id: "ORD-{{ '%06d' | format((vars.order_seq | d(0)) + 1) }}"
+            state: awaiting_payment
+            amount: "{{ request.body.amount }}"
+            currency: "{{ vars.currency }}"
+            created_at: "{{ now() }}"
+        transition:
+          set:
+            state: awaiting_payment
+            order_seq: "{{ (vars.order_seq | d(0)) + 1 }}"
+            last_amount: "{{ request.body.amount }}"
+
+      # 兜底：金额非法
+      - name: create-order-bad-amount
+        priority: 200
+        response:
+          status: 422
+          headers:
+            content-type: application/json
+          body:
+            error: invalid_amount
+            message: "amount 必须为正数，收到: {{ request.body.amount }}"
+
+  # ------------------------------------------------------------------ 支付
+  - path: /orders/pay
+    methods: [POST]
+    rules:
+      # 只有处于待支付状态、且金额与下单金额一致才放行
+      - name: pay-order
+        priority: 100
+        when_state: awaiting_payment
+        match:
+          - body: amount
+            equals: "{{ vars.last_amount }}"
+          - header: idempotency-key
+            exists: true
+        response:
+          status: 200
+          headers:
+            content-type: application/json
+          body:
+            paid: true
+            order_seq: "{{ vars.order_seq }}"
+            paid_at: "{{ now('%Y-%m-%d %H:%M:%S') }}"
+        transition:
+          set:
+            state: paid
+            paid_at: "{{ now() }}"
+
+      # 重复支付：已经在 paid 状态时幂等返回
+      - name: pay-order-already-paid
+        priority: 110
+        when_state: paid
+        response:
+          status: 200
+          headers:
+            content-type: application/json
+          body:
+            paid: true
+            duplicate: true
+            message: 订单已支付，本次为幂等响应
+
+      # 待支付状态但金额不一致或缺少幂等键 -> 拒绝
+      - name: pay-order-amount-mismatch
+        priority: 150
+        when_state: awaiting_payment
+        response:
+          status: 422
+          headers:
+            content-type: application/json
+          body:
+            error: payment_rejected
+            message: "支付被拒绝：金额应为 {{ vars.last_amount }}，或缺少 Idempotency-Key 头"
+
+      # 初始状态直接支付 -> 冲突
+      - name: pay-order-before-create
+        priority: 200
+        response:
+          status: 409
+          headers:
+            content-type: application/json
+          body:
+            error: bad_state
+            message: "当前状态 {{ state }} 不允许支付，请先创建订单"
+
+  # ------------------------------------------------------------------ 发货
+  - path: /orders/ship
+    methods: [POST]
+    rules:
+      - name: ship-order
+        priority: 100
+        when_state: paid
+        match:
+          - body: carrier
+            in: [sf, yto, zto]
+        response:
+          status: 200
+          headers:
+            content-type: application/json
+          body:
+            shipped: true
+            carrier: "{{ request.body.carrier }}"
+            tracking_no: "SF{{ uuid() | replace('-', '') | truncate(12, true, '') | upper }}"
+            fires_total: "{{ session.fires['ship-order'] }}"
+        transition:
+          set:
+            state: shipped
+      - name: ship-order-wrong-carrier
+        priority: 150
+        when_state: paid
+        response:
+          status: 400
+          headers:
+            content-type: application/json
+          body:
+            error: unsupported_carrier
+            message: "不支持的承运商: {{ request.body.carrier }}"
+
+  # ------------------------------------------------------------------ 查询
+  - path: /orders/status
+    methods: [GET]
+    rules:
+      - name: get-status
+        response:
+          status: 200
+          headers:
+            content-type: application/json
+          body:
+            state: "{{ state }}"
+            order_seq: "{{ vars.order_seq }}"
+            last_amount: "{{ vars.last_amount }}"
+            request_count: "{{ session.request_count }}"
